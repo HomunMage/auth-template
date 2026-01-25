@@ -100,43 +100,37 @@ An attacker who intercepts the authorization code cannot exchange it without the
 
 ---
 
-## Public vs Confidential Clients
+## Security Architecture
 
-### Public Client (Authentik example)
-- Cannot securely store secrets (browser apps, mobile apps)
-- Uses PKCE for security
-- Token exchange happens directly in browser
+### All Token Exchanges via Backend
 
-```typescript
-// Frontend exchanges code directly
-const tokens = await fetch(tokenUrl, {
-  method: 'POST',
-  body: new URLSearchParams({
-    grant_type: 'authorization_code',
-    code: authCode,
-    client_id: 'xxx',
-    code_verifier: verifier,  // PKCE proof
-    redirect_uri: 'http://localhost/callback'
-  })
-});
+For security, **ALL** OAuth token exchanges go through the backend - even for public clients like Authentik. This keeps OAuth URLs and any secrets server-side only.
+
+```
+Frontend                    Backend                     OAuth Provider
+   │                           │                              │
+   │  1. Redirect to provider ─────────────────────────────> │
+   │                           │                              │
+   │  2. Callback with code  <─────────────────────────────── │
+   │                           │                              │
+   │  3. POST /api/login/{provider}/token                     │
+   │     {code, code_verifier} │                              │
+   │  ─────────────────────>   │                              │
+   │                           │  4. Exchange code + secret   │
+   │                           │  ─────────────────────────>  │
+   │                           │                              │
+   │                           │  5. Tokens                   │
+   │                           │  <─────────────────────────  │
+   │  6. Tokens + userinfo     │                              │
+   │  <─────────────────────   │                              │
 ```
 
-### Confidential Client (Google example)
-- Can securely store secrets (backend servers)
-- Uses client_secret + PKCE for extra security
-- Token exchange happens on backend
+### Why Backend-First?
 
-```python
-# Backend exchanges code with secret
-response = requests.post(token_url, data={
-    'grant_type': 'authorization_code',
-    'code': auth_code,
-    'client_id': 'xxx',
-    'client_secret': 'SECRET',  # Only backend knows this
-    'code_verifier': verifier,
-    'redirect_uri': 'http://localhost/callback'
-})
-```
+1. **Secrets stay secret**: Client secrets never touch the browser
+2. **Consistent pattern**: Same flow for all providers
+3. **Future-proof**: Easy to add user registration, rate limiting, etc.
+4. **Token validation**: Backend can validate tokens before returning
 
 ---
 
@@ -218,35 +212,39 @@ export async function handleOAuthCallback(
 
 ### 4. Provider Configuration
 
+Frontend only needs public info (no secrets, no token URLs):
+
 ```typescript
-// Public client (Authentik)
+// Authentik
 export const authentikProvider: OAuthProviderConfig = {
   name: 'authentik',
   authorizeUrl: `${AUTHENTIK_URL}/application/o/authorize/`,
-  tokenUrl: `${AUTHENTIK_URL}/application/o/token/`,
-  userInfoUrl: `${AUTHENTIK_URL}/application/o/userinfo/`,
   clientId: 'your-client-id',
   redirectUri: 'http://localhost:3000/callback/authentik',
   scope: 'openid profile email'
 };
 
-// Confidential client (Google)
+// Google
 export const googleProvider: OAuthProviderConfig = {
   name: 'google',
   authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
-  tokenUrl: 'https://oauth2.googleapis.com/token',
-  userInfoUrl: 'https://www.googleapis.com/oauth2/v3/userinfo',
   clientId: 'your-client-id',
   redirectUri: 'http://localhost:3000/callback/google',
   scope: 'openid profile email'
 };
 ```
 
-### 5. Backend Token Exchange (for confidential clients)
+### 5. Backend Token Exchange (handles all providers)
 
 ```python
-@router.post("/google/token")
-async def google_token_exchange(request: GoogleTokenRequest):
+@router.post("/{provider}/token")
+async def token_exchange(request: TokenRequest, provider: Literal["google", "authentik"]):
+    if provider == "google":
+        return await _exchange_google(request)
+    else:
+        return await _exchange_authentik(request)
+
+async def _exchange_google(request: TokenRequest):
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://oauth2.googleapis.com/token",
@@ -259,15 +257,7 @@ async def google_token_exchange(request: GoogleTokenRequest):
                 "code_verifier": request.code_verifier,
             },
         )
-        tokens = resp.json()
-
-        # Fetch user info
-        userinfo = await client.get(
-            "https://www.googleapis.com/oauth2/v3/userinfo",
-            headers={"Authorization": f"Bearer {tokens['access_token']}"},
-        )
-
-        return {**tokens, "userinfo": userinfo.json()}
+        # ... fetch userinfo and return
 ```
 
 ---
@@ -278,18 +268,17 @@ async def google_token_exchange(request: GoogleTokenRequest):
 auth-template/
 ├── backend/
 │   ├── src/
-│   │   ├── main.py              # FastAPI app
-│   │   └── router/auth.py       # Token exchange endpoint
+│   │   ├── main.py              # FastAPI app, CORS
+│   │   └── router/auth.py       # Token exchange for all providers
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/
 │   │   ├── lib/
 │   │   │   ├── auth/
-│   │   │   │   ├── auth.service.ts   # Login & callback handling
-│   │   │   │   ├── oauth.ts          # Token exchange helpers
+│   │   │   │   ├── auth.service.ts   # Login & callback (via backend)
 │   │   │   │   ├── pkce.ts           # PKCE utilities
-│   │   │   │   └── providers/        # Provider configs
+│   │   │   │   └── providers/        # Provider configs (public info only)
 │   │   │   ├── stores/auth.store.ts  # Auth state management
 │   │   │   └── types/auth.ts         # TypeScript types
 │   │   └── routes/

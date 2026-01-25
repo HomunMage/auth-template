@@ -1,24 +1,66 @@
 # src/router/auth.py
 import os
-from fastapi import APIRouter, HTTPException, Header, status
-from pydantic import BaseModel
-from typing import Optional
+from typing import Literal, Optional
+
 import httpx
+from fastapi import APIRouter, Depends, HTTPException, Header, Path, status
+from pydantic import BaseModel, Field
+
 
 router = APIRouter(prefix="/api/login", tags=["auth"])
 
-# Google config
+# Google config (secrets kept server-side only)
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 
+# Authentik config (public client - no secret needed, but URLs kept server-side)
+AUTHENTIK_URL = os.getenv("AUTHENTIK_URL", "")
+AUTHENTIK_CLIENT_ID = os.getenv("AUTHENTIK_CLIENT_ID", "")
 
-class GoogleTokenRequest(BaseModel):
-    code: str
-    redirect_uri: str
-    code_verifier: str
 
+# --------------------------------------------------
+# Pydantic Models
+# --------------------------------------------------
+
+class TokenRequest(BaseModel):
+    """Request body for OAuth token exchange"""
+    code: str = Field(..., description="Authorization code from OAuth redirect")
+    redirect_uri: str = Field(..., description="Must match the redirect URI used in authorization request")
+    code_verifier: str = Field(..., min_length=43, max_length=128, description="PKCE code verifier")
+
+
+class UserInfo(BaseModel):
+    """User info from OAuth provider"""
+    sub: str
+    email: str
+    name: Optional[str] = None
+    picture: Optional[str] = None
+
+
+class TokenResponse(BaseModel):
+    """Response from OAuth token exchange"""
+    access_token: str
+    refresh_token: Optional[str] = None
+    id_token: Optional[str] = None
+    expires_in: Optional[int] = None
+    userinfo: UserInfo
+
+
+class MeResponse(BaseModel):
+    """Current user information response"""
+    sub: Optional[str] = None
+    email: str
+    name: Optional[str] = None
+    picture: Optional[str] = None
+    provider: Literal["google", "authentik"]
+    role: Optional[str] = None
+
+
+# --------------------------------------------------
+# Token Verification
+# --------------------------------------------------
 
 async def verify_google_token(token: str) -> dict:
     """Verify Google access token by calling userinfo endpoint."""
@@ -35,10 +77,30 @@ async def verify_google_token(token: str) -> dict:
         return resp.json()
 
 
+async def verify_authentik_token(token: str) -> dict:
+    """Verify Authentik access token by calling userinfo endpoint."""
+    if not AUTHENTIK_URL:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentik not configured",
+        )
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{AUTHENTIK_URL}/application/o/userinfo/",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid Authentik token",
+            )
+        return resp.json()
+
+
 async def verify_bearer_token(
     authorization: Optional[str] = Header(None),
 ) -> dict:
-    """Verify token from Authorization header"""
+    """Verify token from Authorization header (tries Google then Authentik)"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -47,10 +109,18 @@ async def verify_bearer_token(
 
     token = authorization.removeprefix("Bearer ").strip()
 
-    # Verify with Google userinfo endpoint
+    # Try Google first
     try:
         userinfo = await verify_google_token(token)
         userinfo["_provider"] = "google"
+        return userinfo
+    except HTTPException:
+        pass
+
+    # Try Authentik
+    try:
+        userinfo = await verify_authentik_token(token)
+        userinfo["_provider"] = "authentik"
         return userinfo
     except HTTPException:
         pass
@@ -61,14 +131,40 @@ async def verify_bearer_token(
     )
 
 
-@router.post("/google/token")
-async def google_token_exchange(request: GoogleTokenRequest):
-    """Exchange Google authorization code for tokens (handles client secret server-side)"""
+# --------------------------------------------------
+# Endpoints
+# --------------------------------------------------
+
+@router.get("/me", response_model=MeResponse)
+async def me(userinfo: dict = Depends(verify_bearer_token)) -> MeResponse:
+    """Get current user information. Requires valid Bearer token."""
+    provider = userinfo.get("_provider", "authentik")
+    return MeResponse(
+        sub=userinfo.get("sub"),
+        email=userinfo.get("email", ""),
+        name=userinfo.get("preferred_username") or userinfo.get("name"),
+        picture=userinfo.get("picture"),
+        provider=provider,
+        role=None,  # Add role logic here if needed
+    )
+
+
+@router.post("/{provider}/token", response_model=TokenResponse)
+async def token_exchange(
+    request: TokenRequest,
+    provider: Literal["google", "authentik"] = Path(..., description="OAuth provider"),
+) -> TokenResponse:
+    """Exchange authorization code for tokens. Supports Google and Authentik."""
+    if provider == "google":
+        return await _exchange_google(request)
+    else:
+        return await _exchange_authentik(request)
+
+
+async def _exchange_google(request: TokenRequest) -> TokenResponse:
+    """Exchange Google authorization code for tokens."""
     if not GOOGLE_CLIENT_SECRET:
-        raise HTTPException(
-            status_code=500,
-            detail="Google OAuth not configured (missing client secret)",
-        )
+        raise HTTPException(status_code=500, detail="Google OAuth not configured")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
@@ -86,12 +182,8 @@ async def google_token_exchange(request: GoogleTokenRequest):
             )
 
             if resp.status_code != 200:
-                error_detail = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text
-                print(f"Google token exchange failed: {error_detail}")
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"Google token exchange failed: {error_detail}",
-                )
+                detail = resp.json() if "application/json" in resp.headers.get("content-type", "") else resp.text
+                raise HTTPException(status_code=400, detail=f"Google token exchange failed: {detail}")
 
             tokens = resp.json()
 
@@ -102,25 +194,83 @@ async def google_token_exchange(request: GoogleTokenRequest):
             )
 
             if userinfo_resp.status_code != 200:
-                raise HTTPException(
-                    status_code=userinfo_resp.status_code,
-                    detail="Failed to fetch Google user info",
-                )
+                raise HTTPException(status_code=400, detail="Failed to fetch Google user info")
 
             userinfo = userinfo_resp.json()
 
-            return {
-                "access_token": tokens["access_token"],
-                "refresh_token": tokens.get("refresh_token"),
-                "id_token": tokens.get("id_token"),
-                "expires_in": tokens.get("expires_in"),
-                "userinfo": userinfo,
-            }
+            return TokenResponse(
+                access_token=tokens["access_token"],
+                refresh_token=tokens.get("refresh_token"),
+                id_token=tokens.get("id_token"),
+                expires_in=tokens.get("expires_in"),
+                userinfo=UserInfo(
+                    sub=userinfo["sub"],
+                    email=userinfo["email"],
+                    name=userinfo.get("name"),
+                    picture=userinfo.get("picture"),
+                ),
+            )
 
         except httpx.TimeoutException:
             raise HTTPException(status_code=504, detail="Google OAuth timeout")
         except HTTPException:
             raise
         except Exception as e:
-            print(f"Google token exchange error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _exchange_authentik(request: TokenRequest) -> TokenResponse:
+    """Exchange Authentik authorization code for tokens (public client)."""
+    if not AUTHENTIK_URL or not AUTHENTIK_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Authentik OAuth not configured")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.post(
+                f"{AUTHENTIK_URL}/application/o/token/",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": request.code,
+                    "redirect_uri": request.redirect_uri,
+                    "client_id": AUTHENTIK_CLIENT_ID,
+                    "code_verifier": request.code_verifier,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+
+            if resp.status_code != 200:
+                detail = resp.json() if "application/json" in resp.headers.get("content-type", "") else resp.text
+                raise HTTPException(status_code=400, detail=f"Authentik token exchange failed: {detail}")
+
+            tokens = resp.json()
+
+            # Fetch user info
+            userinfo_resp = await client.get(
+                f"{AUTHENTIK_URL}/application/o/userinfo/",
+                headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            )
+
+            if userinfo_resp.status_code != 200:
+                raise HTTPException(status_code=400, detail="Failed to fetch Authentik user info")
+
+            userinfo = userinfo_resp.json()
+
+            return TokenResponse(
+                access_token=tokens["access_token"],
+                refresh_token=tokens.get("refresh_token"),
+                id_token=tokens.get("id_token"),
+                expires_in=tokens.get("expires_in"),
+                userinfo=UserInfo(
+                    sub=userinfo["sub"],
+                    email=userinfo["email"],
+                    name=userinfo.get("preferred_username") or userinfo.get("name"),
+                    picture=userinfo.get("picture"),
+                ),
+            )
+
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail="Authentik OAuth timeout")
+        except HTTPException:
+            raise
+        except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
