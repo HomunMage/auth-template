@@ -1,23 +1,21 @@
 # main.py
 
-import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from config.settings import settings
 from router.auth import router as auth_router
 
 app = FastAPI(title="Auth Template API")
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include routers
 app.include_router(auth_router)
 
 
@@ -29,5 +27,4 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get("BACKEND_PORT", 5000))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=settings.backend_port, reload=True)

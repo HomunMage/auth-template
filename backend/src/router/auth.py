@@ -1,23 +1,14 @@
 # src/router/auth.py
-import os
+
 from typing import Literal, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Header, Path, status
 from pydantic import BaseModel, Field
 
+from config.settings import settings
 
 router = APIRouter(prefix="/api/login", tags=["auth"])
-
-# Google config (secrets kept server-side only)
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
-
-# Authentik config (public client - no secret needed, but URLs kept server-side)
-AUTHENTIK_URL = os.getenv("AUTHENTIK_URL", "")
-AUTHENTIK_CLIENT_ID = os.getenv("AUTHENTIK_CLIENT_ID", "")
 
 
 # --------------------------------------------------
@@ -66,7 +57,7 @@ async def verify_google_token(token: str) -> dict:
     """Verify Google access token by calling userinfo endpoint."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            GOOGLE_USERINFO_URL,
+            settings.google.userinfo_url,
             headers={"Authorization": f"Bearer {token}"},
         )
         if resp.status_code != 200:
@@ -79,14 +70,14 @@ async def verify_google_token(token: str) -> dict:
 
 async def verify_authentik_token(token: str) -> dict:
     """Verify Authentik access token by calling userinfo endpoint."""
-    if not AUTHENTIK_URL:
+    if not settings.authentik.url:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentik not configured",
         )
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{AUTHENTIK_URL}/application/o/userinfo/",
+            settings.authentik.userinfo_url,
             headers={"Authorization": f"Bearer {token}"},
         )
         if resp.status_code != 200:
@@ -163,19 +154,19 @@ async def token_exchange(
 
 async def _exchange_google(request: TokenRequest) -> TokenResponse:
     """Exchange Google authorization code for tokens."""
-    if not GOOGLE_CLIENT_SECRET:
+    if not settings.google.client_secret:
         raise HTTPException(status_code=500, detail="Google OAuth not configured")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             resp = await client.post(
-                GOOGLE_TOKEN_URL,
+                settings.google.token_url,
                 data={
                     "grant_type": "authorization_code",
                     "code": request.code,
                     "redirect_uri": request.redirect_uri,
-                    "client_id": GOOGLE_CLIENT_ID,
-                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "client_id": settings.google.client_id,
+                    "client_secret": settings.google.client_secret,
                     "code_verifier": request.code_verifier,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -189,7 +180,7 @@ async def _exchange_google(request: TokenRequest) -> TokenResponse:
 
             # Fetch user info
             userinfo_resp = await client.get(
-                GOOGLE_USERINFO_URL,
+                settings.google.userinfo_url,
                 headers={"Authorization": f"Bearer {tokens['access_token']}"},
             )
 
@@ -221,18 +212,18 @@ async def _exchange_google(request: TokenRequest) -> TokenResponse:
 
 async def _exchange_authentik(request: TokenRequest) -> TokenResponse:
     """Exchange Authentik authorization code for tokens (public client)."""
-    if not AUTHENTIK_URL or not AUTHENTIK_CLIENT_ID:
+    if not settings.authentik.url or not settings.authentik.client_id:
         raise HTTPException(status_code=500, detail="Authentik OAuth not configured")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             resp = await client.post(
-                f"{AUTHENTIK_URL}/application/o/token/",
+                settings.authentik.token_url,
                 data={
                     "grant_type": "authorization_code",
                     "code": request.code,
                     "redirect_uri": request.redirect_uri,
-                    "client_id": AUTHENTIK_CLIENT_ID,
+                    "client_id": settings.authentik.client_id,
                     "code_verifier": request.code_verifier,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -246,7 +237,7 @@ async def _exchange_authentik(request: TokenRequest) -> TokenResponse:
 
             # Fetch user info
             userinfo_resp = await client.get(
-                f"{AUTHENTIK_URL}/application/o/userinfo/",
+                settings.authentik.userinfo_url,
                 headers={"Authorization": f"Bearer {tokens['access_token']}"},
             )
 

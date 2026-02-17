@@ -1,12 +1,12 @@
-FROM python:3.12-slim
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 WORKDIR /app
 
-COPY ./requirements.txt ./requirements.txt
-RUN pip install -r requirements.txt
+COPY pyproject.toml ./
+RUN uv sync --no-dev
 
 COPY ./src/ ./src/
 
 WORKDIR /app/src
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000"]
+CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000"]
