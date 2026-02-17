@@ -3,6 +3,7 @@
 import { providers } from './providers';
 import { generateRandomString, generateCodeChallenge } from './pkce';
 import type { AuthProvider, LoginInfo } from '$lib/types/auth';
+import { isWeb } from '$lib/platform';
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL;
 
@@ -75,10 +76,18 @@ export async function startLogin(providerName: AuthProvider) {
 
 	const codeVerifier = generateRandomString(128);
 	const codeChallenge = await generateCodeChallenge(codeVerifier);
-	const state = generateRandomString(32);
+	const nonce = generateRandomString(32);
 
-	sessionStorage.setItem(`pkce_${providerName}`, codeVerifier);
-	sessionStorage.setItem(`state_${providerName}`, state);
+	if (isWeb()) {
+		// Web: store PKCE in sessionStorage, state is just the nonce
+		sessionStorage.setItem(`pkce_${providerName}`, codeVerifier);
+		sessionStorage.setItem(`state_${providerName}`, nonce);
+	}
+
+	// Mobile: encode verifier in state so the trampoline page can use it.
+	// The trampoline (hosted on our server) does the token exchange, so
+	// the app doesn't need to store PKCE state across the browser round-trip.
+	const state = isWeb() ? nonce : `${nonce}.${codeVerifier}`;
 
 	const params = new URLSearchParams({
 		response_type: 'code',
@@ -114,15 +123,14 @@ export async function handleOAuthCallback(
 	}
 
 	// Exchange code via backend (backend has secrets)
-	const tokens = await exchangeCodeViaBackend(
-		providerName,
-		code,
-		provider.redirectUri,
-		verifier
-	);
+	const tokens = await exchangeCodeViaBackend(providerName, code, provider.redirectUri, verifier);
 
 	// Get user info and role from backend
 	const me = await fetchMe(tokens.access_token);
+
+	// Clean up PKCE storage
+	sessionStorage.removeItem(`pkce_${providerName}`);
+	sessionStorage.removeItem(`state_${providerName}`);
 
 	return {
 		provider: providerName,
@@ -137,5 +145,31 @@ export async function handleOAuthCallback(
 			picture: tokens.userinfo.picture
 		},
 		role: me?.role
+	};
+}
+
+/**
+ * Handle deep link callback from Android trampoline.
+ * The trampoline page already exchanged the code for tokens.
+ * Parses authtemplate://auth?data=<json> and returns LoginInfo.
+ */
+export function handleDeepLinkCallback(url: string): LoginInfo {
+	const parsed = new URL(url);
+	const dataParam = parsed.searchParams.get('data');
+
+	if (!dataParam) {
+		throw new Error('Invalid deep link: missing data');
+	}
+
+	const data = JSON.parse(dataParam);
+
+	return {
+		provider: data.provider,
+		accessToken: data.accessToken,
+		refreshToken: data.refreshToken,
+		idToken: data.idToken,
+		expiresAt: data.expiresAt,
+		userInfo: data.userInfo,
+		role: data.role
 	};
 }

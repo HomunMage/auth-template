@@ -1,6 +1,6 @@
-# OAuth 2.0 Authentication Tutorial
+# OAuth 2.0 Authentication Template
 
-A practical guide to implementing OAuth 2.0 with PKCE using SvelteKit and FastAPI.
+A practical guide to implementing OAuth 2.0 with PKCE using SvelteKit and FastAPI, supporting both **web** and **mobile** (Android/iOS via Capacitor).
 
 ## Table of Contents
 
@@ -9,7 +9,9 @@ A practical guide to implementing OAuth 2.0 with PKCE using SvelteKit and FastAP
 - [PKCE Flow Explained](#pkce-flow-explained)
 - [Public vs Confidential Clients](#public-vs-confidential-clients)
 - [Implementation Guide](#implementation-guide)
+- [Mobile Support (Capacitor)](#mobile-support-capacitor)
 - [Project Structure](#project-structure)
+- [Environment Variables](#environment-variables)
 - [Setup](#setup)
 
 ---
@@ -164,16 +166,19 @@ export async function generateCodeChallenge(verifier: string): Promise<string> {
 export async function startLogin(providerName: AuthProvider) {
   const provider = providers[providerName];
 
-  // Generate PKCE values
   const codeVerifier = generateRandomString(128);
   const codeChallenge = await generateCodeChallenge(codeVerifier);
-  const state = generateRandomString(32);
+  const nonce = generateRandomString(32);
 
-  // Store for callback verification
-  sessionStorage.setItem(`pkce_${providerName}`, codeVerifier);
-  sessionStorage.setItem(`state_${providerName}`, state);
+  if (isWeb()) {
+    // Web: store PKCE in sessionStorage, state is just the nonce
+    sessionStorage.setItem(`pkce_${providerName}`, codeVerifier);
+    sessionStorage.setItem(`state_${providerName}`, nonce);
+  }
 
-  // Build authorization URL
+  // Mobile: encode verifier in state so the trampoline page can use it
+  const state = isWeb() ? nonce : `${nonce}.${codeVerifier}`;
+
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: provider.clientId,
@@ -184,12 +189,11 @@ export async function startLogin(providerName: AuthProvider) {
     code_challenge_method: 'S256'
   });
 
-  // Redirect to authorization server
   window.location.href = `${provider.authorizeUrl}?${params}`;
 }
 ```
 
-### 3. Handle Callback
+### 3. Handle Callback (Web)
 
 ```typescript
 export async function handleOAuthCallback(
@@ -197,7 +201,6 @@ export async function handleOAuthCallback(
   code: string,
   state: string
 ): Promise<LoginInfo> {
-  // Verify state to prevent CSRF
   const savedState = sessionStorage.getItem(`state_${providerName}`);
   const verifier = sessionStorage.getItem(`pkce_${providerName}`);
 
@@ -205,8 +208,8 @@ export async function handleOAuthCallback(
     throw new Error('Invalid OAuth state');
   }
 
-  // Exchange code for tokens (method depends on client type)
-  // ... see full implementation in source
+  // Exchange code via backend, get tokens + userinfo
+  // Clean up sessionStorage after
 }
 ```
 
@@ -262,6 +265,107 @@ async def _exchange_google(request: TokenRequest):
 
 ---
 
+## Mobile Support (Capacitor)
+
+This template supports Android/iOS via [Capacitor](https://capacitorjs.com/). The key challenge is that **OAuth providers don't allow custom URL schemes** (e.g., `authtemplate://`) as redirect URIs for web client types. The solution is the **trampoline pattern**.
+
+### Mobile Detection
+
+Platform detection uses build-time `VITE_PLATFORM` env var with runtime Capacitor checks:
+
+```typescript
+// frontend/src/lib/platform/detect.ts
+const isMobile = import.meta.env.VITE_PLATFORM === 'mobile';
+
+export function isWeb(): boolean {
+  return !isMobile;
+}
+
+export async function getPlatform(): Promise<Platform> {
+  if (!isMobile) return 'web';
+  const { Capacitor } = await import('@capacitor/core');
+  const platform = Capacitor.getPlatform();
+  if (platform === 'android') return 'android';
+  if (platform === 'ios') return 'ios';
+  return 'web';
+}
+```
+
+**Build distinction** (`vite.config.ts`):
+- **Web build**: Capacitor plugins are externalized (not bundled)
+- **Mobile build** (`VITE_PLATFORM=mobile`): Capacitor plugins are bundled
+
+### Trampoline Pattern (Mobile OAuth)
+
+Since Google doesn't allow custom URL schemes as redirect URIs:
+
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
+│  Mobile App │     │ Trampoline   │     │  OAuth Provider  │
+│ (Capacitor) │     │ (Prod Server)│     │  (Google/etc)    │
+└──────┬──────┘     └──────┬───────┘     └────────┬────────┘
+       │                   │                       │
+       │ 1. Open Chrome browser                    │
+       │    with authorize URL ───────────────────>│
+       │    redirect_uri = prodUrl/callback/android│
+       │    state = nonce.verifier (PKCE in state) │
+       │                                           │
+       │                   │  2. Redirect with code│
+       │                   │<──────────────────────│
+       │                   │                       │
+       │                   │ 3. Extract verifier   │
+       │                   │    from state         │
+       │                   │ 4. Exchange code      │
+       │                   │    for tokens ───────>│
+       │                   │                       │
+       │                   │ 5. Receive tokens <───│
+       │                   │                       │
+       │ 6. Deep link:     │                       │
+       │    authtemplate:// │                       │
+       │    auth?data=JSON │                       │
+       │<──────────────────│                       │
+       │                   │                       │
+       │ 7. Parse LoginInfo│                       │
+       │    Store in auth  │                       │
+       │    Navigate to /  │                       │
+```
+
+**Why encode PKCE verifier in `state`?**
+Android may kill the app while the user is in Chrome. PKCE verifier stored in sessionStorage would be lost. Encoding it in the OAuth `state` parameter ensures the trampoline page has everything needed. The backend's `client_secret` maintains security.
+
+### Deep Link Handling
+
+The app listens for deep links in `+layout.svelte`:
+
+```typescript
+onMount(() => {
+  if (!isWeb()) {
+    import('@capacitor/app').then(({ App }) => {
+      // Warm start: app in background
+      App.addListener('appUrlOpen', ({ url }) => {
+        processDeepLink(url);
+      });
+
+      // Cold start: app killed, relaunched via deep link
+      App.getLaunchUrl().then((result) => {
+        if (result?.url) processDeepLink(result.url);
+      });
+    });
+  }
+});
+```
+
+### Trampoline Callback Pages
+
+Located at `frontend/src/routes/callback/android/{provider}/+page.svelte`:
+1. Receives auth code + state from OAuth provider redirect
+2. Extracts PKCE verifier from state (`nonce.verifier` format)
+3. Exchanges code for tokens via backend API
+4. Fetches user role via `/api/login/me`
+5. Builds `LoginInfo` JSON and redirects to app via deep link
+
+---
+
 ## Project Structure
 
 ```
@@ -276,19 +380,66 @@ auth-template/
 │   ├── src/
 │   │   ├── lib/
 │   │   │   ├── auth/
-│   │   │   │   ├── auth.service.ts   # Login & callback (via backend)
+│   │   │   │   ├── auth.service.ts   # Login, callback, deep link handler
 │   │   │   │   ├── pkce.ts           # PKCE utilities
 │   │   │   │   └── providers/        # Provider configs (public info only)
+│   │   │   ├── platform/
+│   │   │   │   ├── detect.ts         # isWeb(), getPlatform()
+│   │   │   │   ├── types.ts          # Platform type
+│   │   │   │   └── index.ts          # Re-exports
 │   │   │   ├── stores/auth.store.ts  # Auth state management
 │   │   │   └── types/auth.ts         # TypeScript types
 │   │   └── routes/
+│   │       ├── +layout.svelte        # Deep link listener (mobile)
 │   │       ├── login/+page.svelte    # Login page
-│   │       └── callback/             # OAuth callbacks
+│   │       └── callback/
+│   │           ├── google/           # Web callback
+│   │           ├── authentik/        # Web callback
+│   │           └── android/          # Mobile trampoline callbacks
+│   │               ├── google/
+│   │               └── authentik/
+│   ├── capacitor.config.ts           # Capacitor configuration
 │   ├── Dockerfile
 │   └── package.json
 ├── docker-compose.yml
 └── .env.example
 ```
+
+---
+
+## Environment Variables
+
+### Backend (`.env`)
+
+| Variable | Description |
+|----------|-------------|
+| `AUTHENTIK_URL` | Authentik instance URL |
+| `AUTHENTIK_CLIENT_ID` | Authentik OAuth client ID |
+| `GOOGLE_CLIENT_ID` | Google OAuth client ID |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret (backend only!) |
+
+### Frontend (injected at build time via `vite.config.ts`)
+
+| Variable | Description |
+|----------|-------------|
+| `VITE_BACKEND_URL` | Backend API URL (auto-set by build mode) |
+| `VITE_AUTHENTIK_URL` | Authentik URL (from `AUTHENTIK_URL`) |
+| `VITE_AUTHENTIK_CLIENT_ID` | Authentik client ID (from `AUTHENTIK_CLIENT_ID`) |
+| `VITE_AUTHENTIK_REDIRECT_URI` | Callback URL (web or mobile trampoline) |
+| `VITE_GOOGLE_CLIENT_ID` | Google client ID (from `GOOGLE_CLIENT_ID`) |
+| `VITE_GOOGLE_REDIRECT_URI` | Callback URL (web or mobile trampoline) |
+| `VITE_PLATFORM` | `"browser"` (default) or `"mobile"` for Capacitor builds |
+
+### Mobile-specific
+
+| Variable | Description |
+|----------|-------------|
+| `VITE_PLATFORM` | Set to `"mobile"` for Capacitor builds |
+| `PROD_URL` | Production server URL for trampoline redirects |
+
+**Key insight**: Redirect URIs differ between web and mobile:
+- **Web**: `http://localhost:3000/callback/{provider}`
+- **Mobile**: `https://your-app.example.com/callback/android/{provider}` (trampoline)
 
 ---
 
@@ -305,13 +456,15 @@ auth-template/
    **Google:**
    - Create credentials at https://console.cloud.google.com/apis/credentials
    - Add redirect URI: `http://localhost:3000/callback/google`
+   - For mobile, also add: `https://your-app.example.com/callback/android/google`
 
    **Authentik:**
    - Create OAuth2 Provider in Authentik admin
    - Add redirect URI: `http://localhost:3000/callback/authentik`
+   - For mobile, also add: `https://your-app.example.com/callback/android/authentik`
    - Use public client (PKCE enabled)
 
-3. **Run:**
+3. **Run (web):**
    ```bash
    docker compose up
    ```
@@ -326,7 +479,29 @@ auth-template/
    cd frontend && npm install && npm run dev
    ```
 
-4. **Open:** http://localhost:3000
+4. **Build for mobile (Capacitor):**
+   ```bash
+   cd frontend
+
+   # Install dependencies
+   npm install
+
+   # Build for mobile (bundles Capacitor plugins)
+   VITE_PLATFORM=mobile npm run build
+
+   # Add Android platform (first time only)
+   npx cap add android
+
+   # Sync web assets to native project
+   npx cap sync
+
+   # Or use the shortcut: npm run cap
+
+   # Open in Android Studio
+   npx cap open android
+   ```
+
+5. **Open:** http://localhost:3000
 
 ---
 
@@ -339,6 +514,8 @@ auth-template/
 - [x] Use HTTPS in production
 - [x] Validate token signatures (for JWTs)
 - [x] Implement token refresh before expiry
+- [x] Mobile: PKCE verifier encoded in state (survives app kill)
+- [x] Mobile: Trampoline pattern for OAuth redirects
 
 ---
 
@@ -348,3 +525,4 @@ auth-template/
 - [PKCE RFC 7636](https://tools.ietf.org/html/rfc7636)
 - [OpenID Connect](https://openid.net/connect/)
 - [OAuth 2.0 Security Best Practices](https://tools.ietf.org/html/draft-ietf-oauth-security-topics)
+- [Capacitor Documentation](https://capacitorjs.com/docs)
